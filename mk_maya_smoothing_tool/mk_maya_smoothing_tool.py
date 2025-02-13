@@ -1,19 +1,17 @@
 """
-openAI chatGPT o3mini-high使用
-MK Maya Smoothing Tool (Static Update Version with Undo, Redo, and Freeze Border Correction)
+Maya Smoothing Tool (Static Update Version with Undo, Redo, Freeze Border, 0X Freeze, and Border Vertex Unselect)
 
 【概要】
-- ウィンドウ起動時に対象メッシュの全頂点位置（base state）、隣接情報、及び境界頂点（borderVertices）をキャプチャ
-- ラジオボタンで以下の3種の手法を選択可能：
-    [Taubin Smoothing] / [Laplacian Smoothing] / [Volume Preserving Smoothing]
-- 各手法ごとに、各種パラメータをスライダー＋SpinBoxで設定可能
-- Execute ボタン押下時に、base state から平滑化処理を実行し、結果を反映（頂点選択状態は復元）
-- Undo/Redo ボタンで、直前の平滑化操作を Maya の Undo/Redo で戻せます
-
-※ Taubin smoothing は λ‐ステップ＋μ‐ステップによる体積保持を狙った手法です。
-※ Laplacian Smoothing は単純なラプラシアン平滑化＋元位置ブレンドです。
-※ Volume Preserving Smoothing は Taubin smoothing に近い処理として実装しています。
-※ Freeze Border は、getMeshData() 内で算出した境界頂点に対して平滑化処理を適用しないチェックです。
+- シーン内にオブジェクトが存在しない場合は警告を表示します。
+- ウィンドウ起動時に対象メッシュの全頂点位置（base state）、隣接情報、および
+  ユーザー提供のロジックにより取得した境界頂点（Freeze Border 対象）をキャプチャします。
+- ラジオボタンで3種の手法（Taubin Smoothing, Laplacian Smoothing, Volume Preserving Smoothing）を選択可能。
+- 各手法ごとに各種パラメータ（Smooth Amount, Iterations, Tension, など）をスライダー＋SpinBoxで設定可能です。
+- Execute ボタン押下時、base state から平滑化処理を実行し、結果を反映（Undo/Redo 対応、頂点選択状態復元）。
+- Freeze Border チェックがONの場合、ユーザー提供のロジックで取得した境界頂点は平滑化対象外になります。
+- 0X Freeze チェックがONの場合、ワールドX座標がほぼ0の頂点は更新されません。
+- 選択が頂点以外の場合も、自動的に頂点コンポーネントに変換して処理を行います。
+- さらに「Border Vertex Unselect」ボタンにより、現在の選択から境界頂点を除外（非境界頂点のみ選択）できます。
 """
 
 import maya.cmds as cmds
@@ -46,14 +44,54 @@ def computeWeight(p, q, tension):
         return d
     return 1.0
 
+# ── 境界頂点の取得（ユーザー提供のロジック） ─────────────────────────────
+def getBorderVerticesFromMesh(meshName):
+    # オブジェクトのシェイプノードを取得
+    shapes = cmds.listRelatives(meshName, shapes=True, fullPath=True) or []
+    if not shapes:
+        return set()
+    shape = shapes[0]
+    # 全フェースを取得
+    faces = cmds.ls(shape + ".f[*]", flatten=True)
+    if not faces:
+        return set()
+    # 境界エッジのみを抽出
+    border_edges = cmds.polyListComponentConversion(faces, toEdge=True, border=True)
+    if not border_edges:
+        return set()
+    border_edges = cmds.ls(border_edges, flatten=True)
+    if not border_edges:
+        return set()
+    # 境界エッジから頂点に変換
+    border_verts = cmds.polyListComponentConversion(border_edges, toVertex=True)
+    if not border_verts:
+        return set()
+    border_verts = cmds.ls(border_verts, flatten=True)
+    indices = set()
+    for v in border_verts:
+        try:
+            idx = int(v[v.find('[')+1 : v.find(']')])
+            indices.add(idx)
+        except:
+            pass
+    return indices
+
 # ── メッシュデータ取得 ─────────────────────────────
 def getSelectedVertices():
-    sel = cmds.filterExpand(sm=31)  # 頂点コンポーネント
-    if not sel:
-        sel = cmds.ls(cmds.ls(selection=True)[0] + ".vtx[*]", flatten=True)
-    meshName = sel[0].split('.')[0]
+    sels = cmds.ls(selection=True)
+    if not sels:
+        cmds.warning("何も選択されていません。")
+        return None, []
+    expanded = cmds.filterExpand(sels, sm=31)
+    if not expanded:
+        converted = cmds.polyListComponentConversion(sels, toVertex=True)
+        expanded = cmds.filterExpand(converted, sm=31)
+    if not expanded:
+        cmds.warning("頂点コンポーネントが見つかりません。")
+        return None, []
+    meshName = expanded[0].split('.')[0]
     indices = []
-    for v in sel:
+    for v in expanded:
         try:
             i = int(v[v.find('[')+1 : v.find(']')])
             indices.append(i)
@@ -62,10 +100,9 @@ def getSelectedVertices():
     return meshName, list(set(indices))
 
 def getMeshData(meshName):
-    """
-    メッシュ名から、全頂点位置、隣接情報、及び境界頂点セットを返す。
-    境界頂点は、各エッジの edgeToFace 情報を用い、面数が 1 のエッジに接続する頂点を抽出。
-    """
+    if not cmds.ls(geometry=True):
+        cmds.warning("シーン内にオブジェクトが存在しません。\nオブジェクトを配置してください。")
+        return None, None, None
     shapes = cmds.listRelatives(meshName, shapes=True, fullPath=True) or []
     if not shapes:
         cmds.error("メッシュシェイプが見つかりません。")
@@ -79,29 +116,18 @@ def getMeshData(meshName):
     edges = cmds.polyListComponentConversion(f"{shape}.vtx[*]", toEdge=True)
     edges = cmds.filterExpand(edges, sm=32) or []
     adjacency = defaultdict(set)
-    borderVertices = set()
     for e in edges:
-        info_v = cmds.polyInfo(e, edgeToVertex=True)
-        if info_v:
-            parts_v = info_v[0].strip().split()
+        info = cmds.polyInfo(e, edgeToVertex=True)
+        if info:
+            parts = info[0].strip().split()
             try:
-                v1 = int(parts_v[-2])
-                v2 = int(parts_v[-1])
+                v1 = int(parts[-2])
+                v2 = int(parts[-1])
                 adjacency[v1].add(v2)
                 adjacency[v2].add(v1)
             except:
                 pass
-        info_f = cmds.polyInfo(e, edgeToFace=True)
-        if info_f:
-            parts_f = info_f[0].strip().split()
-            faceCount = len(parts_f) - 2
-            if faceCount < 2:
-                if info_v:
-                    try:
-                        borderVertices.add(int(parts_v[-2]))
-                        borderVertices.add(int(parts_v[-1]))
-                    except:
-                        pass
+    borderVertices = getBorderVerticesFromMesh(meshName)
     return positions, adjacency, borderVertices
 
 def setMeshPositions(meshName, positions):
@@ -117,12 +143,14 @@ def setMeshPositions(meshName, positions):
     cmds.refresh(f=True)
 
 # ── 平滑化アルゴリズム ─────────────────────────────
-def taubinSmooth(positions, adjacency, borderVertices, selIndices, lambda_val, mu_val, tension, freeze_border, sharp_edge_border, iterations):
+def taubinSmooth(positions, adjacency, borderVertices, selIndices, lambda_val, mu_val, tension, freeze_border, sharp_edge_border, freezeX, iterations):
     newPos = positions[:]  # shallow copy
     for it in range(iterations):
         temp = newPos[:]
         for i in selIndices:
             if freeze_border and (i in borderVertices):
+                continue
+            if freezeX and abs(temp[i][0]) < 1e-6:
                 continue
             delta = [0.0, 0.0, 0.0]
             weightSum = 0.0
@@ -140,6 +168,8 @@ def taubinSmooth(positions, adjacency, borderVertices, selIndices, lambda_val, m
         for i in selIndices:
             if freeze_border and (i in borderVertices):
                 continue
+            if freezeX and abs(temp[i][0]) < 1e-6:
+                continue
             delta = [0.0, 0.0, 0.0]
             weightSum = 0.0
             for nb in adjacency[i]:
@@ -154,13 +184,15 @@ def taubinSmooth(positions, adjacency, borderVertices, selIndices, lambda_val, m
             newPos[i] = addVec(temp[i], mulVec(delta, mu_val))
     return newPos
 
-def laplacianSmoothBasic(positions, adjacency, borderVertices, selIndices, smooth_amount, alpha, tension, freeze_border, sharp_edge_border, iterations):
+def laplacianSmoothBasic(positions, adjacency, borderVertices, selIndices, smooth_amount, alpha, tension, freeze_border, sharp_edge_border, freezeX, iterations):
     newPos = positions[:]
     original = {i: positions[i][:] for i in selIndices}
     for it in range(iterations):
         temp = newPos[:]
         for i in selIndices:
             if freeze_border and (i in borderVertices):
+                continue
+            if freezeX and abs(temp[i][0]) < 1e-6:
                 continue
             delta = [0.0, 0.0, 0.0]
             weightSum = 0.0
@@ -178,7 +210,25 @@ def laplacianSmoothBasic(positions, adjacency, borderVertices, selIndices, smoot
             newPos[i] = blended
     return newPos
 
-# ── UI用スライダーウィジェット（スライダー＋SpinBox） ─────────────────────────────
+# ── 現在の選択から境界頂点を除外する機能 ─────────────────────────────
+def unselectBorderVertices():
+    meshName, selIndices = getSelectedVertices()
+    if not meshName:
+        cmds.warning("何も選択されていません。")
+        return
+    borderIndices = getBorderVerticesFromMesh(meshName)
+    newIndices = list(set(selIndices) - borderIndices)
+    if not newIndices:
+        cmds.warning("境界頂点以外の頂点が選択されていません。")
+        cmds.select(clear=True)
+        return
+    shapes = cmds.listRelatives(meshName, shapes=True, fullPath=True) or [meshName]
+    shape = shapes[0]
+    newSel = [f"{shape}.vtx[{i}]" for i in newIndices]
+    cmds.select(newSel, replace=True)
+    print("Border Vertex Unselect：境界頂点を選択解除しました。")
+
+# ── UI用スライダーウィジェット ─────────────────────────────
 from PySide2 import QtWidgets, QtCore
 import maya.OpenMayaUI as omui
 from shiboken2 import wrapInstance
@@ -241,7 +291,11 @@ class SmoothingToolWindow(QtWidgets.QDialog):
         self.setMinimumWidth(450)
         self.buildUI()
         
-        # ウィンドウ起動時に対象メッシュのベース状態、隣接情報、境界頂点をキャプチャ
+        if not cmds.ls(geometry=True):
+            QtWidgets.QMessageBox.warning(self, "Warning", "シーン内にオブジェクトが存在しません。\nオブジェクトを配置してください。")
+            self.meshName = None
+            return
+        
         meshName, selIndices = getSelectedVertices()
         if meshName:
             positions, adjacency, borderVertices = getMeshData(meshName)
@@ -280,10 +334,19 @@ class SmoothingToolWindow(QtWidgets.QDialog):
         
         self.methodGroup.buttonClicked[int].connect(self.stack.setCurrentIndex)
         
+        # 共通の0X Freezeチェックボックス（スタックの下）
+        self.freezeX = QtWidgets.QCheckBox("0X Freeze (ワールドX=0の頂点は固定)")
+        mainLayout.addWidget(self.freezeX)
+        
         # Execute ボタン
         self.btnExecute = QtWidgets.QPushButton("Execute")
         self.btnExecute.clicked.connect(self.onExecute)
         mainLayout.addWidget(self.btnExecute)
+        
+        # Border Vertex Unselect ボタン（現在の選択から境界頂点を除外）
+        self.btnBorderUnselect = QtWidgets.QPushButton("Border Vertex Unselect")
+        self.btnBorderUnselect.clicked.connect(unselectBorderVertices)
+        mainLayout.addWidget(self.btnBorderUnselect)
         
         # Undo/Redo ボタン群
         btnLayout = QtWidgets.QHBoxLayout()
@@ -310,14 +373,14 @@ class SmoothingToolWindow(QtWidgets.QDialog):
         self.taubin_lambda = SliderWidget("Lambda Factor:", 0.0, 1.0, 0.33, is_float=True, decimals=2)
         self.taubin_mu = SliderWidget("Mu Factor:", 0.0, 1.0, 0.34, is_float=True, decimals=2)
         self.taubin_sharp = SliderWidget("Sharp Edge Border:", 0, 100, 1, is_float=False)
-        self.taubin_freeze = QtWidgets.QCheckBox("Freeze Border")
+
         layout.addWidget(self.taubin_smooth_amount)
         layout.addWidget(self.taubin_iteration)
         layout.addLayout(tensionLayout)
         layout.addWidget(self.taubin_lambda)
         layout.addWidget(self.taubin_mu)
         layout.addWidget(self.taubin_sharp)
-        layout.addWidget(self.taubin_freeze)
+
         return page
 
     def buildLaplacianPage(self):
@@ -378,26 +441,27 @@ class SmoothingToolWindow(QtWidgets.QDialog):
             if not selIndices:
                 selIndices = list(range(len(positions)))
             method = self.methodGroup.checkedId()
+            freezeX = self.freezeX.isChecked()
             if method == 0:  # Taubin Smoothing
                 lam = self.taubin_lambda.value() * self.taubin_smooth_amount.value()
                 mu  = -self.taubin_mu.value() * self.taubin_smooth_amount.value()
                 newPositions = taubinSmooth(positions, adjacency, borderVertices, selIndices, lam, mu, 
                                               self.taubin_tension.currentText(),
                                               self.taubin_freeze.isChecked(), self.taubin_sharp.value(),
-                                              self.taubin_iteration.value())
+                                              freezeX, self.taubin_iteration.value())
             elif method == 1:  # Laplacian Smoothing
                 newPositions = laplacianSmoothBasic(positions, adjacency, borderVertices, selIndices, 
                                                     self.lap_smooth_amount.value(), self.lap_alpha.value(),
                                                     self.lap_tension.currentText(),
                                                     self.lap_freeze.isChecked(), self.lap_sharp.value(),
-                                                    self.lap_iteration.value())
+                                                    freezeX, self.lap_iteration.value())
             elif method == 2:  # Volume Preserving Smoothing
                 lam = self.vol_smooth_amount.value() * 0.35
                 mu  = -self.vol_smooth_amount.value() * 0.36
                 newPositions = taubinSmooth(positions, adjacency, borderVertices, selIndices, lam, mu, 
                                               self.vol_tension.currentText(),
                                               self.vol_freeze.isChecked(), self.vol_sharp.value(),
-                                              self.vol_iteration.value())
+                                              freezeX, self.vol_iteration.value())
             setMeshPositions(meshName, newPositions)
             compList = [f"{meshName}.vtx[{i}]" for i in selIndices]
             cmds.select(compList, replace=True)
@@ -407,6 +471,23 @@ class SmoothingToolWindow(QtWidgets.QDialog):
         finally:
             cmds.undoInfo(closeChunk=True)  # Undo チャンク終了
             
+def unselectBorderVertices():
+    meshName, selIndices = getSelectedVertices()
+    if not meshName:
+        cmds.warning("何も選択されていません。")
+        return
+    borderIndices = getBorderVerticesFromMesh(meshName)
+    newIndices = list(set(selIndices) - borderIndices)
+    if not newIndices:
+        cmds.warning("境界頂点以外の頂点が選択されていません。")
+        cmds.select(clear=True)
+        return
+    shapes = cmds.listRelatives(meshName, shapes=True, fullPath=True) or [meshName]
+    shape = shapes[0]
+    newSel = [f"{shape}.vtx[{i}]" for i in newIndices]
+    cmds.select(newSel, replace=True)
+    print("Border Vertex Unselect：境界頂点を選択解除しました。")
+
 def showSmoothingTool():
     global smoothingToolWindow
     try:
